@@ -13,7 +13,7 @@ use crate::{
 };
 use exec::Request;
 use ggus::GGufMetaMapExt;
-use log::info;
+use log::{info, warn};
 use model::Message;
 use nn::Tensor;
 use operators::cuda::{self, Device};
@@ -36,10 +36,16 @@ pub struct Service {
     terminal: Terminal,
 }
 
+#[derive(Clone)]
 pub struct Terminal {
     sender: Sender<Command>,
     cache_parts: Box<[(Device, usize)]>,
     components: Arc<OnceLock<ModelComponents>>,
+}
+
+pub struct OwnedMessage {
+    pub role: String,
+    pub content: String,
 }
 
 pub enum ReturnReason {
@@ -216,6 +222,41 @@ impl Terminal {
                     .unwrap()
             }
         }
+
+        self.sender
+            .send(Command::Insert(Request {
+                session,
+                prompt: tokenizer.encode(&prompt).into(),
+                out: 1,
+            }))
+            .is_ok()
+    }
+
+    pub fn start_chat(&self, session: Session, messages: &[OwnedMessage]) -> bool {
+        let ModelComponents {
+            tokenizer,
+            chat_template,
+            ..
+        } = self.components.wait();
+
+        let prompt = if let Some(chat_template) = &chat_template {
+            chat_template
+                .render(
+                    &messages
+                        .iter()
+                        .map(|m| Message {
+                            role: m.role.as_str(),
+                            content: m.content.as_str(),
+                        })
+                        .collect::<Vec<_>>(),
+                    true,
+                )
+                .unwrap()
+        } else {
+            // 如果没有聊天模板，返回 false 表示失败
+            warn!("no chat template");
+            return false;
+        };
 
         self.sender
             .send(Command::Insert(Request {

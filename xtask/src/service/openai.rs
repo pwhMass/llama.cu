@@ -1,4 +1,5 @@
-﻿use serde::{Deserialize, Serialize};
+﻿use openai_struct::ModelIdsShared;
+use serde::{Deserialize, Serialize};
 
 pub const V1_COMPLETIONS: &str = "/v1/completions";
 pub const V1_COMPLETIONS_OBJECT: &str = "chat.completion";
@@ -6,7 +7,7 @@ pub const V1_COMPLETIONS_OBJECT: &str = "chat.completion";
 /// <https://www.openaicto.com/api-reference/completions>
 #[derive(Serialize, Deserialize)]
 pub struct Completions {
-    pub model: String,
+    pub model: ModelIdsShared,
     pub prompt: String,
 }
 #[derive(Serialize, Deserialize)]
