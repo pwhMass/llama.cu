@@ -1,19 +1,9 @@
-﻿use llama_cu::{DistKVCache, Message, SampleArgs, Service, Session, SessionId, Terminal, utok};
-use std::{collections::BTreeMap, ffi::c_int, iter::zip, path::Path, time::Instant};
+use llama_cu::{DistKVCache, SampleArgs, Session, SessionId, Terminal, utok};
+use std::{collections::BTreeMap, iter::zip, time::Instant};
 
-fn service(model: impl AsRef<Path>, gpus: &[c_int], use_cuda_grpah: bool) {
-    let service = Service::new(model, gpus, use_cuda_grpah);
-    let terminal = service.terminal().clone();
-    tokio::task::spawn_blocking(move || {
-        let mut caches = CacheManager::new(terminal);
-        let _ = service;
-    });
-}
-
-struct CacheManager {
+pub(crate) struct CacheManager {
     terminal: Terminal,
     caches: BTreeMap<Instant, (Vec<utok>, DistKVCache)>,
-    next_id: usize,
 }
 
 impl CacheManager {
@@ -21,17 +11,15 @@ impl CacheManager {
         Self {
             terminal,
             caches: Default::default(),
-            next_id: 0,
         }
     }
 
-    pub fn send(&mut self, msgs: &[Message], sample_args: SampleArgs) -> (SessionId, Vec<utok>) {
-        let id = SessionId(self.next_id);
-        self.next_id += 1;
-
-        let text = self.terminal.render(msgs);
-        let tokens = self.terminal.tokenize(&text);
-
+    pub fn send(
+        &mut self,
+        id: SessionId,
+        tokens: Vec<utok>,
+        sample_args: SampleArgs,
+    ) -> (SessionId, Vec<utok>) {
         let best_cache = self
             .caches
             .iter()
@@ -56,6 +44,10 @@ impl CacheManager {
             &tokens[pos..],
         );
         (id, tokens)
+    }
+
+    pub fn insert(&mut self, tokens: Vec<utok>, cache: DistKVCache) {
+        self.caches.insert(Instant::now(), (tokens, cache));
     }
 }
 
