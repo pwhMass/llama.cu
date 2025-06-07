@@ -231,7 +231,7 @@ impl Worker<'_> {
                     }
                     let out_idx = out_idx(&reqs, output.iter().map(|(_, len)| *len), ctx);
                     // 加载输入
-                    let (key, tok) = models.load_toks(&tokens, &loading);
+                    let (key, tok) = models.load_toks(&mut handle, &tokens, &loading);
                     // 快速启动路径
                     fast_embd.launch(tok, &pre_kv_pairs, fast_map, &mut handle, &loading, &stream);
                     // 通知协处理单元

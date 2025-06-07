@@ -16,6 +16,72 @@ use std::{
 };
 use tokeneer::utok;
 
+// TODO 这个有一个问题，n_toks 可以很长，可能会导致超出 engine 中的'let mut pre_kv_pairs = ctx.malloc::<KVPair>(max_tok);'
+struct ModelsWithOneDyn<'ctx> {
+    models: BTreeMap<NonZeroUsize, ModelExec<'ctx>>,
+    dyn_model: Option<(NonZeroUsize, ModelExec<'ctx>)>,
+    mapped: Option<NonZeroUsize>,
+    graph: NNGraph<Tensor<*const VirByte, 2>>,
+}
+
+impl<'ctx> ModelsWithOneDyn<'ctx> {
+    pub fn new(
+        graph: NNGraph<Tensor<*const VirByte, 2>>,
+        models: BTreeMap<NonZeroUsize, ModelExec<'ctx>>,
+    ) -> Self {
+        Self {
+            models,
+            dyn_model: None,
+            mapped: None,
+            graph,
+        }
+    }
+
+    // 获取大于等于len的第一个key，如果len大于所有key，则返回len，
+    // TODO 可能需要优化策略，防止多次建图
+    pub fn get_key(&self, len: NonZero<usize>) -> NonZeroUsize {
+        self.models
+            .range(len..)
+            .next()
+            .map(|(k, _)| *k)
+            .unwrap_or(len)
+    }
+
+    pub fn get_mut(&mut self, key: NonZero<usize>) -> Option<&mut ModelExec<'ctx>> {
+        self.models.get_mut(&key).or_else(|| {
+            self.dyn_model
+                .as_mut()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, m)| m)
+        })
+    }
+
+    pub fn map_exec(
+        &mut self,
+        key: NonZero<usize>,
+        handle: &mut Handle<'ctx>,
+        pages: &mut MemPages,
+    ) {
+        // 检查当前映射的模型
+        if let Some(mapped) = self.mapped {
+            if mapped == key {
+                return;
+            }
+            // 当前映射的模型不是要映射的模型，解映射
+            self.get_mut(mapped).unwrap().unmap(pages)
+        }
+        // 建立映射
+        if self.models.get_mut(&key).map(|m| m.map(pages)).is_none() {
+            log::info!("create modelExec for key {}", key.get());
+            let mut exec = ModelExec::new(self.graph.clone(), key.get(), handle, pages, false);
+            exec.map(pages);
+            let _ = self.dyn_model.replace((key, exec));
+        }
+        // 更新记录
+        self.mapped = Some(key)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Req<Cache> {
     pub kv_cache: Cache,
@@ -24,8 +90,7 @@ pub(crate) struct Req<Cache> {
 }
 
 pub(crate) struct ModelGroup<'ctx> {
-    models: BTreeMap<NonZeroUsize, ModelExec<'ctx>>,
-    mapped: Option<NonZeroUsize>,
+    models_with_one_dyn: ModelsWithOneDyn<'ctx>,
     attn: Attn,
     pages: MemPages,
     _weight: VirMem,
@@ -77,33 +142,44 @@ impl<'ctx> ModelGroup<'ctx> {
             dev.index(),
             time.elapsed(),
         );
+        let models_with_one_dyn = ModelsWithOneDyn::new(graph, models);
         Self {
-            models,
-            mapped: None,
+            models_with_one_dyn,
             attn,
             pages,
             _weight,
         }
     }
 
-    pub fn load_toks(&mut self, toks: &[utok], loading: &Stream) -> (NonZeroUsize, &mut [DevByte]) {
+    pub fn load_toks(
+        &mut self,
+        handle: &mut Handle<'ctx>,
+        toks: &[utok],
+        loading: &Stream,
+    ) -> (NonZeroUsize, &mut [DevByte]) {
         let len = NonZeroUsize::new(toks.len()).unwrap();
-        let (ans, _) = self.models.range(len..).next().unwrap();
-        let key = NonZeroUsize::new(ans.get()).unwrap();
-        self.map_exec(key);
+        let key = self.models_with_one_dyn.get_key(len);
+        self.models_with_one_dyn
+            .map_exec(key, handle, &mut self.pages);
         let tok = self
-            .models
-            .get_mut(&key)
+            .models_with_one_dyn
+            .get_mut(key)
             .unwrap()
             .load_toks_host(toks, loading);
         (key, tok)
     }
 
     #[cfg(nccl)]
-    pub fn share_toks(&mut self, key: NonZeroUsize, handle: &mut Handle, stream: &Stream<'ctx>) {
-        self.map_exec(key);
+    pub fn share_toks(
+        &mut self,
+        key: NonZeroUsize,
+        handle: &mut Handle<'ctx>,
+        stream: &Stream<'ctx>,
+    ) {
+        self.models_with_one_dyn
+            .map_exec(key, handle, &mut self.pages);
         if let Some(comm) = &handle.comm {
-            let toks = self.models.get_mut(&key).unwrap().toks_buf();
+            let toks = self.models_with_one_dyn.get_mut(key).unwrap().toks_buf();
             comm.broadcast(toks, None, 0, stream)
         }
     }
@@ -116,7 +192,7 @@ impl<'ctx> ModelGroup<'ctx> {
         stream: &Stream<'ctx>,
     ) -> Tensor<*const VirByte, 2> {
         let Self {
-            models,
+            models_with_one_dyn,
             attn,
             pages,
             ..
@@ -142,31 +218,9 @@ impl<'ctx> ModelGroup<'ctx> {
             })
             .collect::<Vec<_>>();
 
-        let model = models.get_mut(&key).unwrap();
+        let model = models_with_one_dyn.get_mut(key).unwrap();
         model.load_pos(&reqs, stream);
         model.launch(attn, handle, &reqs, stream)
-    }
-
-    /// 为组中的指定执行模型映射物理页
-    fn map_exec(&mut self, key: NonZero<usize>) {
-        let Self {
-            models,
-            mapped,
-            pages,
-            ..
-        } = self;
-        // 检查当前映射的模型
-        if let Some(mapped) = mapped {
-            if *mapped == key {
-                return;
-            }
-            // 当前映射的模型不是要映射的模型，解映射
-            models.get_mut(mapped).unwrap().unmap(pages)
-        }
-        // 建立映射
-        models.get_mut(&key).unwrap().map(pages);
-        // 更新记录
-        *mapped = Some(key)
     }
 }
 
